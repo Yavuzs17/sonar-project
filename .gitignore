@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+*.egg-info/
+
+# Build
+build/
+*.o
+*.out
+sonar
+
+# LaTeX
+*.tex
+*.pdf
+*.aux
+*.log
+*.toc
+*.synctex.gz
+
+# IDE / tools
+.claude/settings.local.json
+.vscode/
+*.code-workspace
+
+# Misc
+analysis_results.md
+*.md.bak
