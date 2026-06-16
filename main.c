@@ -9,7 +9,12 @@
  *
  * Çalıştırma:
  *   ./sonar                    Tam donanımla
- *   ./sonar --no-hardware      Mock modunda
+ *   ./sonar --no-hardware      Mock modunda (senaryo 1)
+ *   ./sonar --no-hardware-1    Mock: karışık sahne (3 hedef + parazit)
+ *   ./sonar --no-hardware-2    Mock: yaklaşan tek hedef
+ *   ./sonar --no-hardware-3    Mock: koridor (iki yan duvar + karşı duvar)
+ *   ./sonar --no-hardware-4    Mock: temiz sahne (seyrek parazit)
+ *   ./sonar --no-hardware-5    Mock: yoğun parazit (clutter)
  *   ./sonar --no-calib         Kalibrasyon yüklemeden
  *   ./sonar --help             Yardım
  */
@@ -67,6 +72,7 @@ static int                   current_freq_hz    = 40000;
 static int                   dwell_default_ms   = DWELL_MS_VARSAYILAN;
 static OutputMode            output_mode        = OUTPUT_BOTH;
 static bool                  no_hardware        = false;
+static int                   sim_scenario       = 1;     /* 1..5 — --no-hardware-N */
 static bool                  no_calib           = false;
 static char                  calib_dizin[512]   = CALIB_DIZIN_VARSAYILAN;
 static float                 current_az         = 0.0f;
@@ -300,49 +306,125 @@ static void emit_echo_batch(const float *dists, const float *delays, int n,
     log_msg("INFO", "Echo batch: n=%d, az=%.1f el=%.1f", n, az, el);
 }
 
-/* ─── Simülasyon: Sahte Echo Üretici ────────────────────────────────────────
+/* ─── Simülasyon Yardımcıları ───────────────────────────────────────────────
  * --no-hardware modunda gerçek sensor yerine matematiksel hedefler üretir.
- * Üç sabit hedef + rastgele gürültü echo'ları üretir; tek batch event olarak
- * yayınlar (önceden her echo ayrı paket gönderiyordu).                     */
-static void simulate_fake_echoes(float az_deg, float el_deg) {
-    static int tick = 0;
-    tick++;
+ * Her senaryo ayrı bir sahne tanımlar; istenen senaryo --no-hardware-N ile
+ * seçilir (sim_scenario global'i). Senaryo fonksiyonları dists/delays
+ * dizilerini doldurur ve n sayacını artırır.                              */
 
-    float dists[8], delays[8];
-    int n = 0;
+#define SIM_ECHO_MAKS 16   /* dists/delays dizi kapasitesi */
 
+/* Mesafeden çift-yön gecikme (us) — 343 m/s ses hızı varsayımı */
+static inline float mesafe_to_delay_us(float mesafe_m) {
+    return (mesafe_m * 2.0f / 343.0f) * 1e6f;
+}
+
+/* Tek echo ekle (kapasite kontrollü) */
+static inline void sim_echo_ekle(float *dists, float *delays, int *n,
+                                 float mesafe_m) {
+    if (*n >= SIM_ECHO_MAKS) return;
+    dists[*n]  = mesafe_m;
+    delays[*n] = mesafe_to_delay_us(mesafe_m);
+    (*n)++;
+}
+
+/* Senaryo 1 — Karışık sahne: üç hedef + rastgele parazit (klasik mock). */
+static void sim_sahne_karisik(float az_deg, float el_deg, int tick,
+                              float *dists, float *delays, int *n) {
     /* Hedef 1: Dalgalı duvar — tüm yönlerden görünür */
-    {
-        float wave   = 0.5f * sinf(az_deg * 0.05f + tick * 0.1f);
-        float mesafe = 2.5f + wave;
-        dists[n]  = mesafe;
-        delays[n] = (mesafe * 2.0f / 343.0f) * 1e6f;
-        n++;
-    }
+    float wave = 0.5f * sinf(az_deg * 0.05f + tick * 0.1f);
+    sim_echo_ekle(dists, delays, n, 2.5f + wave);
 
     /* Hedef 2: Sol-yan sabit hedef (az ≈ -20°, el ≈ 0°) */
-    if (fabsf(az_deg - (-20.0f)) < 7.5f && fabsf(el_deg) < 7.5f) {
-        float mesafe = 1.5f;
-        dists[n]  = mesafe;
-        delays[n] = (mesafe * 2.0f / 343.0f) * 1e6f;
-        n++;
-    }
+    if (fabsf(az_deg - (-20.0f)) < 7.5f && fabsf(el_deg) < 7.5f)
+        sim_echo_ekle(dists, delays, n, 1.5f);
 
     /* Hedef 3: Sağ-üst hareketli hedef (az > 10°, el > 10°) */
     if (az_deg > 10.0f && el_deg > 10.0f) {
         float oscillation = 0.3f * sinf(tick * 0.2f);
-        float mesafe      = 3.5f + oscillation;
-        dists[n]  = mesafe;
-        delays[n] = (mesafe * 2.0f / 343.0f) * 1e6f;
-        n++;
+        sim_echo_ekle(dists, delays, n, 3.5f + oscillation);
     }
 
     /* Rastgele gürültü echo'su — %10 ihtimal */
-    if ((rand() % 10) == 0) {
-        float mesafe = 1.0f + (rand() % 400) / 100.0f;   /* 1–5 m */
-        dists[n]  = mesafe;
-        delays[n] = (mesafe * 2.0f / 343.0f) * 1e6f;
-        n++;
+    if ((rand() % 10) == 0)
+        sim_echo_ekle(dists, delays, n, 1.0f + (rand() % 400) / 100.0f);
+}
+
+/* Senaryo 2 — Yaklaşan tek hedef: boresight çevresinde 5 m'den 0.5 m'ye
+ * yaklaşıp sıfırlanan tek bir hedef. Mesafe takibi / çarpışma uyarısı testi. */
+static void sim_sahne_yaklasan(float az_deg, float el_deg, int tick,
+                               float *dists, float *delays, int *n) {
+    if (fabsf(az_deg) < 10.0f && fabsf(el_deg) < 10.0f) {
+        float faz    = (tick % 120) / 120.0f;     /* 0..1 testere dişi */
+        float mesafe = 5.0f - faz * 4.5f;         /* 5.0 → 0.5 m */
+        sim_echo_ekle(dists, delays, n, mesafe);
+    }
+}
+
+/* Senaryo 3 — Koridor: sol ve sağ yan duvarlar + ileride karşı duvar.
+ * Çok hedef ayrımı ve sınır tespiti testi.                                 */
+static void sim_sahne_koridor(float az_deg, float el_deg, int tick,
+                              float *dists, float *delays, int *n) {
+    (void)tick;
+    /* Sol duvar (az < -15°) */
+    if (az_deg < -15.0f && fabsf(el_deg) < 20.0f)
+        sim_echo_ekle(dists, delays, n, 1.2f);
+    /* Sağ duvar (az > +15°) */
+    if (az_deg > 15.0f && fabsf(el_deg) < 20.0f)
+        sim_echo_ekle(dists, delays, n, 1.2f);
+    /* Karşı duvar — ileride dar koni */
+    if (fabsf(az_deg) < 7.5f && fabsf(el_deg) < 7.5f)
+        sim_echo_ekle(dists, delays, n, 4.0f);
+}
+
+/* Senaryo 4 — Temiz sahne: çoğu zaman boş, nadiren (~%3) tek parazit.
+ * Yanlış-pozitif reddi / gürültü tabanı testi.                            */
+static void sim_sahne_temiz(float az_deg, float el_deg, int tick,
+                            float *dists, float *delays, int *n) {
+    (void)az_deg; (void)el_deg; (void)tick;
+    if ((rand() % 33) == 0)
+        sim_echo_ekle(dists, delays, n, 1.0f + (rand() % 500) / 100.0f);
+}
+
+/* Senaryo 5 — Yoğun parazit (clutter): her adımda 3–6 rastgele echo.
+ * İşlem hattı / çoklu-hedef stres testi.                                   */
+static void sim_sahne_clutter(float az_deg, float el_deg, int tick,
+                              float *dists, float *delays, int *n) {
+    (void)az_deg; (void)el_deg; (void)tick;
+    int adet = 3 + rand() % 4;   /* 3–6 echo */
+    for (int i = 0; i < adet; i++)
+        sim_echo_ekle(dists, delays, n, 0.5f + (rand() % 550) / 100.0f);
+}
+
+/* İnsan-okunur senaryo adı (log/startup için). */
+static const char *sim_scenario_adi(int s) {
+    switch (s) {
+        case 1: return "karisik sahne (3 hedef + parazit)";
+        case 2: return "yaklasan tek hedef";
+        case 3: return "koridor (iki yan duvar + karsi duvar)";
+        case 4: return "temiz sahne (seyrek parazit)";
+        case 5: return "yogun parazit (clutter)";
+        default: return "bilinmeyen";
+    }
+}
+
+/* ─── Simülasyon: Sahte Echo Üretici ────────────────────────────────────────
+ * sim_scenario değerine göre ilgili sahne fonksiyonunu çağırır ve toplanan
+ * echo'ları tek batch event olarak yayınlar.                              */
+static void simulate_fake_echoes(float az_deg, float el_deg) {
+    static int tick = 0;
+    tick++;
+
+    float dists[SIM_ECHO_MAKS], delays[SIM_ECHO_MAKS];
+    int n = 0;
+
+    switch (sim_scenario) {
+        case 2:  sim_sahne_yaklasan(az_deg, el_deg, tick, dists, delays, &n); break;
+        case 3:  sim_sahne_koridor (az_deg, el_deg, tick, dists, delays, &n); break;
+        case 4:  sim_sahne_temiz   (az_deg, el_deg, tick, dists, delays, &n); break;
+        case 5:  sim_sahne_clutter (az_deg, el_deg, tick, dists, delays, &n); break;
+        case 1:
+        default: sim_sahne_karisik (az_deg, el_deg, tick, dists, delays, &n); break;
     }
 
     emit_echo_batch(dists, delays, n, az_deg, el_deg);
@@ -356,8 +438,11 @@ static void *scan_thread_func(void *arg) {
     int dwell_ms = arg ? *(int *)arg : DWELL_MS_VARSAYILAN;
     if (arg) free(arg);
 
-    log_msg("INFO", "Tarama basladi (dwell=%d ms, mod=%s)",
-            dwell_ms, no_hardware ? "simulasyon" : "donanim");
+    if (no_hardware)
+        log_msg("INFO", "Tarama basladi (dwell=%d ms, mod=simulasyon, senaryo %d: %s)",
+                dwell_ms, sim_scenario, sim_scenario_adi(sim_scenario));
+    else
+        log_msg("INFO", "Tarama basladi (dwell=%d ms, mod=donanim)", dwell_ms);
 
     static int g_sweep_direction = 1;   /* 1: ileri (-az→+az), -1: geri (+az→-az) */
     static int g_sweep_count     = 0;
@@ -962,11 +1047,16 @@ static bool isle_komut(char *satir) {
 /* ─── Komut Satırı Argümanları ───────────────────────────────────────────────*/
 static void parse_args(int argc, char *argv[]) {
     static const struct option uzun_secenekler[] = {
-        {"no-hardware", no_argument,       NULL, 'n'},
-        {"calib-dir",   required_argument, NULL, 'c'},
-        {"no-calib",    no_argument,       NULL, 'C'},
-        {"log-level",   required_argument, NULL, 'l'},
-        {"help",        no_argument,       NULL, 'h'},
+        {"no-hardware",   no_argument,       NULL, 'n'},
+        {"no-hardware-1", no_argument,       NULL, 1001},
+        {"no-hardware-2", no_argument,       NULL, 1002},
+        {"no-hardware-3", no_argument,       NULL, 1003},
+        {"no-hardware-4", no_argument,       NULL, 1004},
+        {"no-hardware-5", no_argument,       NULL, 1005},
+        {"calib-dir",     required_argument, NULL, 'c'},
+        {"no-calib",      no_argument,       NULL, 'C'},
+        {"log-level",     required_argument, NULL, 'l'},
+        {"help",          no_argument,       NULL, 'h'},
         {NULL, 0, NULL, 0}
     };
 
@@ -974,7 +1064,12 @@ static void parse_args(int argc, char *argv[]) {
     while ((secim = getopt_long(argc, argv, "nc:Cl:h", uzun_secenekler, NULL)) != -1) {
         switch (secim) {
         case 'n':
-            no_hardware = true;
+            no_hardware  = true;
+            sim_scenario = 1;
+            break;
+        case 1001: case 1002: case 1003: case 1004: case 1005:
+            no_hardware  = true;
+            sim_scenario = secim - 1000;   /* --no-hardware-N → senaryo N */
             break;
         case 'c':
             strncpy(calib_dizin, optarg, sizeof(calib_dizin) - 1);
@@ -993,7 +1088,12 @@ static void parse_args(int argc, char *argv[]) {
         case 'h':
             fprintf(stderr,
                 "Kullanim: %s [secenekler]\n"
-                "  --no-hardware        Mock mod (donanim gerekmez)\n"
+                "  --no-hardware        Mock mod (donanim gerekmez, senaryo 1)\n"
+                "  --no-hardware-1      Mock: karisik sahne (3 hedef + parazit)\n"
+                "  --no-hardware-2      Mock: yaklasan tek hedef\n"
+                "  --no-hardware-3      Mock: koridor (iki yan duvar + karsi duvar)\n"
+                "  --no-hardware-4      Mock: temiz sahne (seyrek parazit)\n"
+                "  --no-hardware-5      Mock: yogun parazit (clutter)\n"
                 "  --calib-dir <path>   Kalibrasyon dizini (varsayilan: %s)\n"
                 "  --no-calib           Kalibrasyon dosyalarini yukleme\n"
                 "  --log-level <0-3>    Log seviyesi (0=debug, 3=error)\n"
@@ -1014,8 +1114,11 @@ int main(int argc, char *argv[]) {
     srand((unsigned)time(NULL));
     signal(SIGINT, sigint_handler);
 
-    log_msg("INFO", "Sonar sistemi baslatiliyor%s",
-            no_hardware ? " (mock mod)" : "");
+    if (no_hardware)
+        log_msg("INFO", "Sonar sistemi baslatiliyor (mock mod - senaryo %d: %s)",
+                sim_scenario, sim_scenario_adi(sim_scenario));
+    else
+        log_msg("INFO", "Sonar sistemi baslatiliyor");
 
     if (!baslat_moduller()) {
         cleanup_all();
