@@ -24,9 +24,11 @@
 #define BF_CACHE_STEP_DEG   1.0   /* Kabul edilen minimum adım (°)            */
 #define BF_CACHE_RANGE_DEG 90.0   /* Kabul edilen maksimum açı sınırı (°)    */
 
-static double s_az_max = 30.0;   /* Aktif azimuth yarı-aralık (derece)       */
-static double s_el_max = 30.0;   /* Aktif elevation yarı-aralık (derece)     */
-static double s_step   =  5.0;   /* Aktif tarama adımı (derece)              */
+static double s_az_max = 25.0;   /* Aktif azimuth yarı-aralık (derece)       */
+                                 /* Varsayılan ±25°: TX kapsaması ±27° içinde */
+                                 /* kalır, grating/SLL'nin en kötü olduğu uçlardan kaçınır */
+static double s_el_max = 25.0;   /* Aktif elevation yarı-aralık (derece)     */
+static double s_step   =  5.0;   /* Aktif tarama adımı (derece, HPBW 8.8° ile uyumlu) */
 
 /* ─── Eleman Koordinatları ──────────────────────────────────────────────────
  * Normalize birim koordinatlar; gerçek metre = koordinat × eleman_mesafesi_m

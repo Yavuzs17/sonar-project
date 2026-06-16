@@ -487,11 +487,12 @@ int comms_emit_event(const char *event_name, const char *params_json) {
 
 /* ─── Kısayol Event Fonksiyonları ───────────────────────────────────────────*/
 
-int comms_emit_echo(float dist, float delay_us, float az, float el) {
+int comms_emit_echo(float dist, float delay_us, float amp, float az, float el) {
     cJSON *p = cJSON_CreateObject();
     if (!p) return COMMS_ERR_BUFFER;
     cJSON_AddNumberToObject(p, "dist",     (double)dist);
     cJSON_AddNumberToObject(p, "delay_us", (double)delay_us);
+    cJSON_AddNumberToObject(p, "amp",      (double)amp);
     cJSON_AddNumberToObject(p, "az",       (double)az);
     cJSON_AddNumberToObject(p, "el",       (double)el);
     int ret = event_gonder("echo", p);
@@ -499,10 +500,10 @@ int comms_emit_echo(float dist, float delay_us, float az, float el) {
     return ret;
 }
 
-int comms_emit_echo_batch(const float *dist, const float *delay_us, int n,
-                          float az, float el) {
+int comms_emit_echo_batch(const float *dist, const float *delay_us,
+                          const float *amp, int n, float az, float el) {
     if (n <= 0) return COMMS_OK;            /* boş batch — no-op */
-    if (!dist || !delay_us) return COMMS_ERR_NULL;
+    if (!dist || !delay_us || !amp) return COMMS_ERR_NULL;
 
     cJSON *p = cJSON_CreateObject();
     if (!p) return COMMS_ERR_BUFFER;
@@ -524,6 +525,7 @@ int comms_emit_echo_batch(const float *dist, const float *delay_us, int n,
         }
         cJSON_AddNumberToObject(item, "dist",     (double)dist[i]);
         cJSON_AddNumberToObject(item, "delay_us", (double)delay_us[i]);
+        cJSON_AddNumberToObject(item, "amp",      (double)amp[i]);
         cJSON_AddItemToArray(arr, item);
     }
     cJSON_AddItemToObject(p, "echoes", arr);

@@ -57,6 +57,13 @@
 #define KOMUT_TAMPONU_BOY         256
 #define CALIB_YOL_BOY             640
 
+/* ─── Dairesel Görüş Alanı (FoV) ─────────────────────────────────────────────
+ * Kare az/el grid'inin köşeleri boresight'tan radyal olarak çok dışarı yönelir
+ * (ör. (30,30) ≈ 41°). TX kapsaması ±27° ve grating lob bu bölgede baskın.
+ * ψ = acos(cos az · cos el) > FOV_YARICAP_DEG olan köşe noktaları taranmaz.   */
+#define FOV_YARICAP_DEG           27.0f
+#define DEG2RAD                   (3.14159265358979323846 / 180.0)
+
 /* ─── Çıktı Modu ─────────────────────────────────────────────────────────────*/
 typedef enum {
     OUTPUT_LOG  = 1,   /* yalnızca stderr log   */
@@ -113,16 +120,16 @@ static void emit_event(const char *payload) {
     fflush(stdout);
 }
 
-static void emit_echo(float dist, float delay_us, float az, float el) {
+static void emit_echo(float dist, float delay_us, float amp, float az, float el) {
     char buf[256];
     snprintf(buf, sizeof(buf),
              "{\"event\":\"echo\",\"dist\":%.3f,\"delay_us\":%.1f,"
-             "\"az\":%.1f,\"el\":%.1f}",
-             dist, delay_us, az, el);
+             "\"amp\":%.3f,\"az\":%.1f,\"el\":%.1f}",
+             dist, delay_us, amp, az, el);
     emit_event(buf);
-    comms_emit_echo(dist, delay_us, az, el);
-    log_msg("INFO", "Echo: %.3f m, gecikme %.1f us, az=%.1f el=%.1f",
-            dist, delay_us, az, el);
+    comms_emit_echo(dist, delay_us, amp, az, el);
+    log_msg("INFO", "Echo: %.3f m, gecikme %.1f us, amp=%.3f, az=%.1f el=%.1f",
+            dist, delay_us, amp, az, el);
 }
 
 static void emit_doppler(float freq, float velocity) {
@@ -278,8 +285,8 @@ static bool baslat_moduller(void) {
 /* ─── Echo batch helper ─────────────────────────────────────────────────────
  * Aynı (az, el) konumunda toplanmış birden fazla echo'yu tek pakette gönderir.
  * Hem stdout JSON (varsa) hem socket (comms_emit_echo_batch) yolu çağrılır. */
-static void emit_echo_batch(const float *dists, const float *delays, int n,
-                            float az, float el) {
+static void emit_echo_batch(const float *dists, const float *delays,
+                            const float *amps, int n, float az, float el) {
     if (n <= 0) return;
 
     /* stdout JSON (legacy mode) */
@@ -288,10 +295,10 @@ static void emit_echo_batch(const float *dists, const float *delays, int n,
         int off = snprintf(buf, sizeof(buf),
             "{\"event\":\"echo_batch\",\"az\":%.1f,\"el\":%.1f,\"echoes\":[",
             az, el);
-        for (int i = 0; i < n && off < (int)sizeof(buf) - 64; i++) {
+        for (int i = 0; i < n && off < (int)sizeof(buf) - 80; i++) {
             off += snprintf(buf + off, sizeof(buf) - (size_t)off,
-                "%s{\"dist\":%.3f,\"delay_us\":%.1f}",
-                i ? "," : "", dists[i], delays[i]);
+                "%s{\"dist\":%.3f,\"delay_us\":%.1f,\"amp\":%.3f}",
+                i ? "," : "", dists[i], delays[i], amps[i]);
         }
         if (off < (int)sizeof(buf) - 2) {
             snprintf(buf + off, sizeof(buf) - (size_t)off, "]}");
@@ -300,7 +307,7 @@ static void emit_echo_batch(const float *dists, const float *delays, int n,
     }
 
     /* Socket clients */
-    comms_emit_echo_batch(dists, delays, n, az, el);
+    comms_emit_echo_batch(dists, delays, amps, n, az, el);
 
     /* Tek satır özet log — n echo için 1 syscall */
     log_msg("INFO", "Echo batch: n=%d, az=%.1f el=%.1f", n, az, el);
@@ -312,88 +319,106 @@ static void emit_echo_batch(const float *dists, const float *delays, int n,
  * seçilir (sim_scenario global'i). Senaryo fonksiyonları dists/delays
  * dizilerini doldurur ve n sayacını artırır.                              */
 
-#define SIM_ECHO_MAKS 16   /* dists/delays dizi kapasitesi */
+#define SIM_ECHO_MAKS  16     /* dists/delays/amps dizi kapasitesi            */
+#define SIM_HPBW_DEG   8.8f    /* MATLAB pattern: ana lob -3 dB genişliği     */
+#define SIM_GENLIK_ESIK 0.03f  /* Bu genliğin altındaki echo eklenmez (~-15dB)*/
 
 /* Mesafeden çift-yön gecikme (us) — 343 m/s ses hızı varsayımı */
 static inline float mesafe_to_delay_us(float mesafe_m) {
     return (mesafe_m * 2.0f / 343.0f) * 1e6f;
 }
 
-/* Tek echo ekle (kapasite kontrollü) */
-static inline void sim_echo_ekle(float *dists, float *delays, int *n,
-                                 float mesafe_m) {
+/* Ana-lob genlik tepkisi: hedefin gerçek yönü (az0,el0) ile huzme yönü (az,el)
+ * arasındaki açısal farka göre Gaussian. HPBW=8.8° → yarı genişlikte -3 dB.
+ * Böylece tek bir nokta hedef komşu huzmelerde yumuşak şekilde belirir →
+ * Python tarafında genlik interpolasyonu (centroiding) test edilebilir.    */
+static float sim_beam_genlik(float az, float el, float az0, float el0, float guc) {
+    float d2 = (az - az0) * (az - az0) + (el - el0) * (el - el0);
+    return guc * expf(-2.7726f * d2 / (SIM_HPBW_DEG * SIM_HPBW_DEG)); /* 4·ln2 */
+}
+
+/* Tek echo ekle (kapasite kontrollü). genlik: bağıl 0..1. */
+static inline void sim_echo_ekle(float *dists, float *delays, float *amps,
+                                 int *n, float mesafe_m, float genlik) {
     if (*n >= SIM_ECHO_MAKS) return;
     dists[*n]  = mesafe_m;
     delays[*n] = mesafe_to_delay_us(mesafe_m);
+    amps[*n]   = genlik;
     (*n)++;
 }
 
 /* Senaryo 1 — Karışık sahne: üç hedef + rastgele parazit (klasik mock). */
-static void sim_sahne_karisik(float az_deg, float el_deg, int tick,
-                              float *dists, float *delays, int *n) {
-    /* Hedef 1: Dalgalı duvar — tüm yönlerden görünür */
-    float wave = 0.5f * sinf(az_deg * 0.05f + tick * 0.1f);
-    sim_echo_ekle(dists, delays, n, 2.5f + wave);
+static void sim_sahne_karisik(float az, float el, int tick,
+                              float *d, float *de, float *a, int *n) {
+    /* Hedef 1: Dalgalı duvar — tüm FoV'da görünür, güçlü */
+    float wave = 0.5f * sinf(az * 0.05f + tick * 0.1f);
+    sim_echo_ekle(d, de, a, n, 2.5f + wave, 0.9f);
 
-    /* Hedef 2: Sol-yan sabit hedef (az ≈ -20°, el ≈ 0°) */
-    if (fabsf(az_deg - (-20.0f)) < 7.5f && fabsf(el_deg) < 7.5f)
-        sim_echo_ekle(dists, delays, n, 1.5f);
+    /* Hedef 2: Sol nokta hedef (az=-20°, el=0°) — huzme taperli güçlü dönüş */
+    float g2 = sim_beam_genlik(az, el, -20.0f, 0.0f, 1.0f);
+    if (g2 > SIM_GENLIK_ESIK)
+        sim_echo_ekle(d, de, a, n, 1.5f, g2);
 
-    /* Hedef 3: Sağ-üst hareketli hedef (az > 10°, el > 10°) */
-    if (az_deg > 10.0f && el_deg > 10.0f) {
-        float oscillation = 0.3f * sinf(tick * 0.2f);
-        sim_echo_ekle(dists, delays, n, 3.5f + oscillation);
-    }
+    /* Hedef 3: Sağ-üst hareketli nokta hedef (az=15°, el=15°) */
+    float osc = 0.3f * sinf(tick * 0.2f);
+    float g3  = sim_beam_genlik(az, el, 15.0f, 15.0f, 0.7f);
+    if (g3 > SIM_GENLIK_ESIK)
+        sim_echo_ekle(d, de, a, n, 3.5f + osc, g3);
 
-    /* Rastgele gürültü echo'su — %10 ihtimal */
+    /* Rastgele gürültü echo'su — %10 ihtimal, düşük genlik */
     if ((rand() % 10) == 0)
-        sim_echo_ekle(dists, delays, n, 1.0f + (rand() % 400) / 100.0f);
+        sim_echo_ekle(d, de, a, n, 1.0f + (rand() % 400) / 100.0f,
+                      0.10f + (rand() % 30) / 100.0f);
 }
 
-/* Senaryo 2 — Yaklaşan tek hedef: boresight çevresinde 5 m'den 0.5 m'ye
- * yaklaşıp sıfırlanan tek bir hedef. Mesafe takibi / çarpışma uyarısı testi. */
-static void sim_sahne_yaklasan(float az_deg, float el_deg, int tick,
-                               float *dists, float *delays, int *n) {
-    if (fabsf(az_deg) < 10.0f && fabsf(el_deg) < 10.0f) {
+/* Senaryo 2 — Yaklaşan tek hedef: boresight'ta 5 m'den 0.5 m'ye yaklaşıp
+ * sıfırlanan nokta hedef. Mesafe takibi / çarpışma uyarısı testi.          */
+static void sim_sahne_yaklasan(float az, float el, int tick,
+                               float *d, float *de, float *a, int *n) {
+    float g = sim_beam_genlik(az, el, 0.0f, 0.0f, 1.0f);
+    if (g > SIM_GENLIK_ESIK) {
         float faz    = (tick % 120) / 120.0f;     /* 0..1 testere dişi */
         float mesafe = 5.0f - faz * 4.5f;         /* 5.0 → 0.5 m */
-        sim_echo_ekle(dists, delays, n, mesafe);
+        sim_echo_ekle(d, de, a, n, mesafe, g);
     }
 }
 
 /* Senaryo 3 — Koridor: sol ve sağ yan duvarlar + ileride karşı duvar.
  * Çok hedef ayrımı ve sınır tespiti testi.                                 */
-static void sim_sahne_koridor(float az_deg, float el_deg, int tick,
-                              float *dists, float *delays, int *n) {
+static void sim_sahne_koridor(float az, float el, int tick,
+                              float *d, float *de, float *a, int *n) {
     (void)tick;
-    /* Sol duvar (az < -15°) */
-    if (az_deg < -15.0f && fabsf(el_deg) < 20.0f)
-        sim_echo_ekle(dists, delays, n, 1.2f);
+    /* Sol duvar (az < -15°) — geniş, güçlü */
+    if (az < -15.0f && fabsf(el) < 20.0f)
+        sim_echo_ekle(d, de, a, n, 1.2f, 0.85f);
     /* Sağ duvar (az > +15°) */
-    if (az_deg > 15.0f && fabsf(el_deg) < 20.0f)
-        sim_echo_ekle(dists, delays, n, 1.2f);
-    /* Karşı duvar — ileride dar koni */
-    if (fabsf(az_deg) < 7.5f && fabsf(el_deg) < 7.5f)
-        sim_echo_ekle(dists, delays, n, 4.0f);
+    if (az > 15.0f && fabsf(el) < 20.0f)
+        sim_echo_ekle(d, de, a, n, 1.2f, 0.85f);
+    /* Karşı duvar — ileride, boresight çevresinde taperli */
+    float gc = sim_beam_genlik(az, el, 0.0f, 0.0f, 0.7f);
+    if (gc > SIM_GENLIK_ESIK)
+        sim_echo_ekle(d, de, a, n, 4.0f, gc);
 }
 
 /* Senaryo 4 — Temiz sahne: çoğu zaman boş, nadiren (~%3) tek parazit.
  * Yanlış-pozitif reddi / gürültü tabanı testi.                            */
-static void sim_sahne_temiz(float az_deg, float el_deg, int tick,
-                            float *dists, float *delays, int *n) {
-    (void)az_deg; (void)el_deg; (void)tick;
+static void sim_sahne_temiz(float az, float el, int tick,
+                            float *d, float *de, float *a, int *n) {
+    (void)az; (void)el; (void)tick;
     if ((rand() % 33) == 0)
-        sim_echo_ekle(dists, delays, n, 1.0f + (rand() % 500) / 100.0f);
+        sim_echo_ekle(d, de, a, n, 1.0f + (rand() % 500) / 100.0f,
+                      0.05f + (rand() % 20) / 100.0f);
 }
 
 /* Senaryo 5 — Yoğun parazit (clutter): her adımda 3–6 rastgele echo.
  * İşlem hattı / çoklu-hedef stres testi.                                   */
-static void sim_sahne_clutter(float az_deg, float el_deg, int tick,
-                              float *dists, float *delays, int *n) {
-    (void)az_deg; (void)el_deg; (void)tick;
+static void sim_sahne_clutter(float az, float el, int tick,
+                              float *d, float *de, float *a, int *n) {
+    (void)az; (void)el; (void)tick;
     int adet = 3 + rand() % 4;   /* 3–6 echo */
     for (int i = 0; i < adet; i++)
-        sim_echo_ekle(dists, delays, n, 0.5f + (rand() % 550) / 100.0f);
+        sim_echo_ekle(d, de, a, n, 0.5f + (rand() % 550) / 100.0f,
+                      0.20f + (rand() % 60) / 100.0f);
 }
 
 /* İnsan-okunur senaryo adı (log/startup için). */
@@ -415,19 +440,28 @@ static void simulate_fake_echoes(float az_deg, float el_deg) {
     static int tick = 0;
     tick++;
 
-    float dists[SIM_ECHO_MAKS], delays[SIM_ECHO_MAKS];
+    float dists[SIM_ECHO_MAKS], delays[SIM_ECHO_MAKS], amps[SIM_ECHO_MAKS];
     int n = 0;
 
     switch (sim_scenario) {
-        case 2:  sim_sahne_yaklasan(az_deg, el_deg, tick, dists, delays, &n); break;
-        case 3:  sim_sahne_koridor (az_deg, el_deg, tick, dists, delays, &n); break;
-        case 4:  sim_sahne_temiz   (az_deg, el_deg, tick, dists, delays, &n); break;
-        case 5:  sim_sahne_clutter (az_deg, el_deg, tick, dists, delays, &n); break;
+        case 2:  sim_sahne_yaklasan(az_deg, el_deg, tick, dists, delays, amps, &n); break;
+        case 3:  sim_sahne_koridor (az_deg, el_deg, tick, dists, delays, amps, &n); break;
+        case 4:  sim_sahne_temiz   (az_deg, el_deg, tick, dists, delays, amps, &n); break;
+        case 5:  sim_sahne_clutter (az_deg, el_deg, tick, dists, delays, amps, &n); break;
         case 1:
-        default: sim_sahne_karisik (az_deg, el_deg, tick, dists, delays, &n); break;
+        default: sim_sahne_karisik (az_deg, el_deg, tick, dists, delays, amps, &n); break;
     }
 
-    emit_echo_batch(dists, delays, n, az_deg, el_deg);
+    emit_echo_batch(dists, delays, amps, n, az_deg, el_deg);
+}
+
+/* ─── Dairesel FoV Testi ─────────────────────────────────────────────────────
+ * Boresight'tan radyal yönelim açısı ψ = acos(cos az · cos el).
+ * Kare grid'in köşeleri (ör. (25,25)≈35°) TX kapsamasını aşar; bu noktalar
+ * taranmaz → temiz kapsama + daha az dwell noktası (daha hızlı tarama).    */
+static inline bool fov_icinde(float az_deg, float el_deg) {
+    double psi = acos(cos(az_deg * DEG2RAD) * cos(el_deg * DEG2RAD)) / DEG2RAD;
+    return psi <= (double)FOV_YARICAP_DEG + 1e-6;
 }
 
 /* ─── Otomatik Tarama Thread'i ───────────────────────────────────────────────
@@ -456,10 +490,13 @@ static void *scan_thread_func(void *arg) {
         float el_max = (float)el_max_d;
         float step   = (float)step_d;
 
-        int az_cnt = (int)round(2.0 * az_max_d / step_d) + 1;
-        int el_cnt = (int)round(2.0 * el_max_d / step_d) + 1;
-        int toplam  = az_cnt * el_cnt;
-        int adim    = 0;
+        /* Dairesel FoV maskesi: yalnızca görüş alanı içindeki noktaları say —
+         * scan_progress total'ı atlanan köşelerle tutarlı olsun. */
+        int toplam = 0;
+        for (float caz = -az_max; caz <= az_max + 1e-6f; caz += step)
+            for (float cel = -el_max; cel <= el_max + 1e-6f; cel += step)
+                if (fov_icinde(caz, cel)) toplam++;
+        int adim = 0;
 
         if ((cycle++ % 10) == 0)
             fprintf(stderr, "[scan] cycle %d: +-%.0f/+-%.0f, step %.0f deg (%d adim) dir=%s\n",
@@ -502,6 +539,9 @@ static void *scan_thread_func(void *arg) {
 
             for (float el = -el_max; el <= el_max + 1e-6f && scan_aktif; el += step) {
 
+                /* Dairesel FoV dışındaki köşe noktalarını atla */
+                if (!fov_icinde(az, el)) continue;
+
                 /* Beamforming yönünü ayarla */
                 bf_set_direction(az, el, (float)current_freq_hz);
 
@@ -510,13 +550,20 @@ static void *scan_thread_func(void *arg) {
                 usleep((useconds_t)(dwell_ms * 1000));
                 pll_burst_stop();
 
-                /* Echo verisi: simülasyon veya gerçek donanım */
+                /* Echo verisi: simülasyon veya gerçek donanım.
+                 * Her iki yol da echo_batch yayınlar → Python tek kod dalı.
+                 * Donanımda şimdilik tek echo (sensor_ilk_echo_oku) → 1 elemanlı
+                 * dizi; genlik zarf detektörü voltajından (sensor_envelope_voltaj). */
                 if (no_hardware) {
                     simulate_fake_echoes(az, el);
                 } else {
                     EchoOlay echo;
-                    if (sensor_ilk_echo_oku(&echo) == SENSOR_OK)
-                        emit_echo(echo.mesafe_m, echo.gecikme_us, az, el);
+                    if (sensor_ilk_echo_oku(&echo) == SENSOR_OK) {
+                        float d[1]  = { echo.mesafe_m };
+                        float de[1] = { (float)echo.gecikme_us };
+                        float a[1]  = { sensor_envelope_voltaj() };
+                        emit_echo_batch(d, de, a, 1, az, el);
+                    }
                 }
 
                 adim++;
@@ -730,8 +777,8 @@ static int socket_komut_handler(const char *cmd, const char *params_json,
         EchoOlay echo;
         if (sensor_ilk_echo_oku(&echo) == SENSOR_OK) {
             snprintf(response_buffer, buffer_size,
-                     "{\"status\":\"ok\",\"dist_m\":%.3f,\"delay_us\":%.1f}",
-                     echo.mesafe_m, echo.gecikme_us);
+                     "{\"status\":\"ok\",\"dist_m\":%.3f,\"delay_us\":%.1f,\"amp\":%.3f}",
+                     echo.mesafe_m, echo.gecikme_us, sensor_envelope_voltaj());
         } else {
             snprintf(response_buffer, buffer_size,
                      "{\"status\":\"error\",\"message\":\"echo yakalanmadi\"}");
@@ -996,7 +1043,8 @@ static bool isle_komut(char *satir) {
         if (sensor_ilk_echo_oku(&echo) != SENSOR_OK)
             log_msg("WARN", "Gecerli echo yok");
         else
-            emit_echo(echo.mesafe_m, echo.gecikme_us, current_az, current_el);
+            emit_echo(echo.mesafe_m, (float)echo.gecikme_us,
+                      sensor_envelope_voltaj(), current_az, current_el);
 
     /* ── read_doppler ──────────────────────────────────────────────────────── */
     } else if (strcmp(cmd, "read_doppler") == 0) {

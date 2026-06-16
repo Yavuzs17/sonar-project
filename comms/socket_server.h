@@ -53,7 +53,7 @@ typedef enum {
  *       comms_init(NULL);
  *       comms_register_handler(my_handler);
  *
- *       comms_emit_echo(1.45f, 8500.0f, 15.0f, 20.0f);
+ *       comms_emit_echo(1.45f, 8500.0f, 0.8f, 15.0f, 20.0f);
  *
  *       comms_cleanup();
  *       return 0;
@@ -75,11 +75,12 @@ int  comms_register_handler(comms_cmd_handler_t handler);
 int  comms_emit_event(const char *event_name, const char *params_json);
 
 /* ─── Kısayol Event Fonksiyonları ───────────────────────────────────────────*/
-int  comms_emit_echo(float dist, float delay_us, float az, float el);
+int  comms_emit_echo(float dist, float delay_us, float amp, float az, float el);
 /* Aynı (az, el) konumundaki birden fazla echo'yu tek event olarak yayınlar.
- * dist[i]/delay_us[i] paralel diziler, n eleman sayısı. n<=0 ise no-op. */
-int  comms_emit_echo_batch(const float *dist, const float *delay_us, int n,
-                           float az, float el);
+ * dist[i]/delay_us[i]/amp[i] paralel diziler, n eleman sayısı. n<=0 ise no-op.
+ * amp: bağıl echo genliği (simülasyon 0..1, donanım zarf voltajı). */
+int  comms_emit_echo_batch(const float *dist, const float *delay_us,
+                           const float *amp, int n, float az, float el);
 int  comms_emit_doppler(float freq, float velocity);
 int  comms_emit_scan_progress(int step, int total, float az, float el);
 int  comms_emit_temperature(float celsius, float sound_speed);
