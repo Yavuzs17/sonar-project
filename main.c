@@ -616,6 +616,8 @@ static void print_help(void) {
         "\n"
         "  burst_start              Manuel burst basla\n"
         "  burst_stop               Burst durdur\n"
+        "  feedback_start           PLL feedback (GPIO17) loop'u basla\n"
+        "  feedback_stop            PLL feedback loop'u durdur\n"
         "\n"
         "  scan_start [dwell_ms]    Otomatik tarama (varsayilan: %d ms)\n"
         "  scan_stop                Taramayi durdur\n"
@@ -624,6 +626,7 @@ static void print_help(void) {
         "  read_temp                Sicaklik ve ses hizi\n"
         "  read_echo                Son echo bilgisi\n"
         "  read_doppler             Doppler frekans ve hiz\n"
+        "  read_vctrl               PLL kilit voltaji + hedef/guncel frekans\n"
         "\n"
         "  mode <log|json|both>     Cikti modunu degistir\n"
         "  log_level <0-3>          Log seviyesi (0=debug, 3=error)\n",
@@ -724,6 +727,14 @@ static int socket_komut_handler(const char *cmd, const char *params_json,
         pll_burst_stop();
         snprintf(response_buffer, buffer_size, "{\"status\":\"ok\"}");
 
+    } else if (strcmp(cmd, "feedback_start") == 0) {
+        pll_start_feedback();
+        snprintf(response_buffer, buffer_size, "{\"status\":\"ok\"}");
+
+    } else if (strcmp(cmd, "feedback_stop") == 0) {
+        pll_stop_feedback();
+        snprintf(response_buffer, buffer_size, "{\"status\":\"ok\"}");
+
     } else if (strcmp(cmd, "scan_start") == 0) {
         int dwell_ms = dwell_default_ms;
         cJSON *dwell_obj = cJSON_GetObjectItem(params, "dwell_ms");
@@ -790,6 +801,12 @@ static int socket_komut_handler(const char *cmd, const char *params_json,
         float v    = sensor_get_doppler_hiz(0);
         snprintf(response_buffer, buffer_size,
                  "{\"status\":\"ok\",\"freq\":%.1f,\"velocity\":%.3f}", freq, v);
+
+    } else if (strcmp(cmd, "read_vctrl") == 0) {
+        snprintf(response_buffer, buffer_size,
+                 "{\"status\":\"ok\",\"vctrl\":%.3f,\"target_hz\":%d,\"current_hz\":%d}",
+                 pll_read_vctrl(), pll_get_target_frequency(),
+                 pll_get_current_frequency());
 
     } else if (strcmp(cmd, "status") == 0) {
         snprintf(response_buffer, buffer_size,
@@ -981,6 +998,15 @@ static bool isle_komut(char *satir) {
         pll_burst_stop();
         log_msg("INFO", "Burst durduruldu");
 
+    /* ── feedback_start / feedback_stop (PLL GPIO17 loop) ──────────────────── */
+    } else if (strcmp(cmd, "feedback_start") == 0) {
+        pll_start_feedback();
+        log_msg("INFO", "PLL feedback loop basladi (GPIO17 referans kare dalga)");
+
+    } else if (strcmp(cmd, "feedback_stop") == 0) {
+        pll_stop_feedback();
+        log_msg("INFO", "PLL feedback loop durduruldu");
+
     /* ── scan_start [dwell_ms] ─────────────────────────────────────────────── */
     } else if (strcmp(cmd, "scan_start") == 0) {
         if (scan_aktif) {
@@ -1051,6 +1077,20 @@ static bool isle_komut(char *satir) {
         float freq = sensor_get_doppler_frekans();
         float hiz  = sensor_get_doppler_hiz(0);
         emit_doppler(freq, hiz);
+
+    /* ── read_vctrl (PLL kilit voltaji + frekans) ──────────────────────────── */
+    } else if (strcmp(cmd, "read_vctrl") == 0) {
+        float vctrl  = pll_read_vctrl();
+        int   hedef  = pll_get_target_frequency();
+        int   guncel = pll_get_current_frequency();
+        char buf[160];
+        snprintf(buf, sizeof(buf),
+                 "{\"event\":\"vctrl\",\"vctrl\":%.3f,"
+                 "\"target_hz\":%d,\"current_hz\":%d}",
+                 vctrl, hedef, guncel);
+        emit_event(buf);
+        log_msg("INFO", "PLL: Vctrl=%.3f V, hedef=%d Hz, guncel=%d Hz",
+                vctrl, hedef, guncel);
 
     /* ── mode <log|json|both> ──────────────────────────────────────────────── */
     } else if (strcmp(cmd, "mode") == 0) {
