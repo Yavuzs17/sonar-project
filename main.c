@@ -618,6 +618,8 @@ static void print_help(void) {
         "  burst_stop               Burst durdur\n"
         "  feedback_start           PLL feedback (GPIO17) loop'u basla\n"
         "  feedback_stop            PLL feedback loop'u durdur\n"
+        "  mute                     VCO sustur (INHIBIT HIGH)\n"
+        "  unmute                   VCO ac (INHIBIT LOW)\n"
         "\n"
         "  scan_start [dwell_ms]    Otomatik tarama (varsayilan: %d ms)\n"
         "  scan_stop                Taramayi durdur\n"
@@ -734,6 +736,14 @@ static int socket_komut_handler(const char *cmd, const char *params_json,
     } else if (strcmp(cmd, "feedback_stop") == 0) {
         pll_stop_feedback();
         snprintf(response_buffer, buffer_size, "{\"status\":\"ok\"}");
+
+    } else if (strcmp(cmd, "mute") == 0) {
+        pll_mute();
+        snprintf(response_buffer, buffer_size, "{\"status\":\"ok\",\"inhibit\":\"high\"}");
+
+    } else if (strcmp(cmd, "unmute") == 0) {
+        pll_unmute();
+        snprintf(response_buffer, buffer_size, "{\"status\":\"ok\",\"inhibit\":\"low\"}");
 
     } else if (strcmp(cmd, "scan_start") == 0) {
         int dwell_ms = dwell_default_ms;
@@ -1006,6 +1016,15 @@ static bool isle_komut(char *satir) {
     } else if (strcmp(cmd, "feedback_stop") == 0) {
         pll_stop_feedback();
         log_msg("INFO", "PLL feedback loop durduruldu");
+
+    /* ── mute / unmute (manuel INHIBIT — burst yokken VCO sustur/ac) ───────── */
+    } else if (strcmp(cmd, "mute") == 0) {
+        pll_mute();
+        log_msg("INFO", "VCO susturuldu (INHIBIT HIGH)");
+
+    } else if (strcmp(cmd, "unmute") == 0) {
+        pll_unmute();
+        log_msg("INFO", "VCO aktif (INHIBIT LOW)");
 
     /* ── scan_start [dwell_ms] ─────────────────────────────────────────────── */
     } else if (strcmp(cmd, "scan_start") == 0) {

@@ -277,7 +277,7 @@ static void *burst_thread_fonk(void *arg) {
         clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &bitis, NULL);
     }
 
-    lgGpioWrite(pll.gpio_handle, INHIBIT_PIN, 1); /* Güvenli son durum: HIGH */
+    lgGpioWrite(pll.gpio_handle, INHIBIT_PIN, 0); /* Güvenli son durum: LOW (GND) — donanim idle/mute seviyesi */
     pll_log(PLL_LOG_INFO, "Burst thread durdu");
     return NULL;
 }
@@ -364,8 +364,8 @@ int pll_init(void) {
         return -3;
     }
 
-    /* INHIBIT_PIN → çıkış, başlangıç HIGH (VCO başlangıçta susturulmuş) */
-    ret = lgGpioClaimOutput(pll.gpio_handle, 0, INHIBIT_PIN, 1);
+    /* INHIBIT_PIN → çıkış, başlangıç LOW (GND) — donanim idle/mute seviyesi */
+    ret = lgGpioClaimOutput(pll.gpio_handle, 0, INHIBIT_PIN, 0);
     if (ret < 0) {
         pll_log(PLL_LOG_ERROR, "INHIBIT_PIN %d alinamadi: hata=%d", INHIBIT_PIN, ret);
         lgGpiochipClose(pll.gpio_handle);
@@ -504,6 +504,28 @@ void pll_burst_stop(void) {
     pll.burst_aktif = 0;
     pthread_join(pll.burst_thread, NULL);
     pll_log(PLL_LOG_INFO, "Burst durduruldu");
+}
+
+/* ─── Manuel INHIBIT Kontrolü ────────────────────────────────────────────────
+ * Burst çalışmıyorken VCO sürekli aktiftir (INHIBIT LOW) — frekansı net ölçmek
+ * için. Aşağıdaki komutlarla elle susturulup tekrar açılabilir.
+ *   pll_mute()   → INHIBIT HIGH (VCO pasif/sustur)
+ *   pll_unmute() → INHIBIT LOW  (VCO aktif/emit)
+ * Burst aktifken çağrılırsa burst thread bir sonraki fazda tekrar üzerine yazar. */
+void pll_mute(void) {
+    if (!pll.baslandi || pll.gpio_handle < 0) return;
+    if (pll.burst_aktif)
+        pll_log(PLL_LOG_WARN, "Burst aktifken mute — burst thread tekrar surecek");
+    lgGpioWrite(pll.gpio_handle, INHIBIT_PIN, 1);
+    pll_log(PLL_LOG_INFO, "INHIBIT HIGH (mute) — VCO susturuldu");
+}
+
+void pll_unmute(void) {
+    if (!pll.baslandi || pll.gpio_handle < 0) return;
+    if (pll.burst_aktif)
+        pll_log(PLL_LOG_WARN, "Burst aktifken unmute — burst thread tekrar surecek");
+    lgGpioWrite(pll.gpio_handle, INHIBIT_PIN, 0);
+    pll_log(PLL_LOG_INFO, "INHIBIT LOW (unmute) — VCO aktif");
 }
 
 /* Frekans taramayı başlatır.

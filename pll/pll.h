@@ -83,6 +83,10 @@ void  pll_stop_feedback(void);
 void  pll_burst_start(int pulse_count, int listen_ms);
 void  pll_burst_stop(void);
 
+/* Manuel INHIBIT — burst yokken VCO'yu sustur/aç (frekans ölçümü için) */
+void  pll_mute(void);    /* INHIBIT HIGH → VCO pasif  */
+void  pll_unmute(void);  /* INHIBIT LOW  → VCO aktif   */
+
 /* Sweep (Frekans Tarama) */
 void  pll_sweep_start(int min_hz, int max_hz, int step_hz, int dwell_ms);
 void  pll_sweep_stop(void);
